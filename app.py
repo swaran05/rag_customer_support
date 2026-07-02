@@ -2,32 +2,42 @@ import os
 import sqlite3
 
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-from langchain_community.vectorstores import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
 from langchain_groq import ChatGroq
 
-# -----------------------------
+# -------------------------------
 # Load Environment Variables
-# -----------------------------
+# -------------------------------
 load_dotenv()
 
 groq_api_key = os.getenv("GROQ_API_KEY")
 
 if not groq_api_key:
-    print("Error: GROQ_API_KEY not found. Please set it in the .env file.")
-    exit()
+    raise Exception("GROQ_API_KEY not found in .env")
 
-# -----------------------------
+# -------------------------------
+# Create FastAPI App
+# -------------------------------
+app = FastAPI(
+    title="Context-Aware Customer Support RAG Bot",
+    description="AI-powered Customer Support Chatbot using RAG",
+    version="1.0"
+)
+
+# -------------------------------
 # Load Embedding Model
-# -----------------------------
+# -------------------------------
 embeddings = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-# -----------------------------
-# Load Chroma Vector Database
-# -----------------------------
+# -------------------------------
+# Load Chroma Vector Store
+# -------------------------------
 vector_store = Chroma(
     persist_directory="chroma_db",
     embedding_function=embeddings
@@ -35,59 +45,67 @@ vector_store = Chroma(
 
 retriever = vector_store.as_retriever(search_kwargs={"k": 3})
 
-# -----------------------------
-# Load Groq Model
-# -----------------------------
+# -------------------------------
+# Load Groq LLM
+# -------------------------------
 llm = ChatGroq(
     groq_api_key=groq_api_key,
-    model_name="llama-3.3-70b-versatile"
+    model_name="llama-3.1-8b-instant"
 )
 
-# -----------------------------
-# Connect SQLite
-# -----------------------------
-conn = sqlite3.connect("users.db")
+# -------------------------------
+# SQLite Connection
+# -------------------------------
+conn = sqlite3.connect("users.db", check_same_thread=False)
 cursor = conn.cursor()
 
-print("=" * 60)
-print("Context-Aware Customer Support RAG Bot")
-print("=" * 60)
+# -------------------------------
+# Request Model
+# -------------------------------
+class ChatRequest(BaseModel):
+    user_id: int
+    user_query: str
 
-while True:
+# -------------------------------
+# Home Endpoint
+# -------------------------------
+@app.get("/")
+def home():
+    return {
+        "message": "Context-Aware Customer Support RAG Bot is running successfully!"
+    }
 
-    user_input = input("\nEnter User ID (or type exit): ")
-
-    if user_input.lower() == "exit":
-        break
-
-    if not user_input.isdigit():
-        print("Please enter a valid numeric User ID.")
-        continue
-
-    user_id = int(user_input)
+# -------------------------------
+# Chat Endpoint
+# -------------------------------
+@app.post("/chat")
+def chat(request: ChatRequest):
 
     cursor.execute(
         "SELECT name, membership_tier FROM users WHERE user_id=?",
-        (user_id,)
+        (request.user_id,)
     )
 
     user = cursor.fetchone()
 
     if user is None:
-        print("User not found. Please enter a valid user_id.")
-        continue
+        raise HTTPException(
+            status_code=404,
+            detail="User not found. Please enter a valid user_id."
+        )
 
     name, membership = user
 
-    query = input("Enter your question: ")
-
-    docs = retriever.invoke(query)
+    docs = retriever.invoke(request.user_query)
 
     if len(docs) == 0:
-        print("I do not have enough information in the provided knowledge base to answer this.")
-        continue
+        return {
+            "answer": "I do not have enough information in the provided knowledge base to answer this."
+        }
 
-    context = "\n\n".join([doc.page_content for doc in docs])
+    context = "\n\n".join(
+        [doc.page_content for doc in docs]
+    )
 
     prompt = f"""
 You are an AI customer support assistant.
@@ -104,10 +122,12 @@ If the answer is not available in the context, say:
 "I do not have enough information in the provided knowledge base to answer this."
 
 Context:
+
 {context}
 
 User Question:
-{query}
+
+{request.user_query}
 
 Answer:
 """
@@ -115,14 +135,14 @@ Answer:
     try:
         response = llm.invoke(prompt)
 
-        print("\n" + "=" * 60)
-        print(f"Hello {name}!")
-        print(f"Membership Tier: {membership}\n")
-        print(response.content)
-        print("=" * 60)
+        return {
+            "name": name,
+            "membership_tier": membership,
+            "answer": response.content
+        }
 
     except Exception as e:
-        print("Error communicating with Groq API.")
-        print(e)
-
-conn.close()
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
